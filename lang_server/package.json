@@ -1,0 +1,26 @@
+{
+  "name": "doc_bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "nodemon index.js"
+  },
+  "type": "module",
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@pinecone-database/pinecone": "^0.1.5",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "gpt-3-encoder": "^1.1.4",
+    "hnswlib-node": "^1.4.2",
+    "langchain": "^0.0.84",
+    "marked": "^5.0.2",
+    "redis": "^4.6.6",
+    "simple-git": "^3.18.0",
+    "ws": "^8.13.0"
+  }
+}
