@@ -1,7 +1,9 @@
 import path from "path";
+import express from "express";
+import cors from "cors";
+import bodyParser from "body-parser";
 import { createServer } from "http";
 import { PineconeClient } from "@pinecone-database/pinecone";
-import { createRequire } from "module";
 import { DirectoryLoader } from "langchain/document_loaders/fs/directory";
 import { TextLoader } from "langchain/document_loaders/fs/text";
 import { PDFLoader } from "langchain/document_loaders/fs/pdf";
@@ -153,9 +155,10 @@ renderer.html = (html) => {
 
 marked.setOptions({ renderer });
 
-const require = createRequire(import.meta.url);
-
-const WebSocket = require("ws");
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+const server = createServer(app);
 
 const txtLocalStorePath = path.join(
   new URL(".", import.meta.url).pathname,
@@ -178,137 +181,144 @@ await client.init({
   environment: process.env.PINECONE_ENV,
 });
 
-const server = createServer();
-const wss = new WebSocket.Server({ server });
-
 updatePinecone(client, indexName, docs);
 
-wss.on("connection", (ws) => {
-  ws.on("message", async (message) => {
-    const data = JSON.parse(message);
-    const question = data.question;
+let clients = [];
 
-    try {
-      await cloneParseOrPullParse();
-      await createPineconeIndex(client, indexName, vectorDimension);
-      console.log("Querying Pinecone vector store...");
+app.get("/sse", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
 
-      const index = client.Index(indexName);
+  clients.push(res);
 
-      const queryEmbedding = await new OpenAIEmbeddings().embedQuery(question);
+  req.on("close", () => {
+    clients = clients.filter((client) => client !== res);
+  });
+});
 
-      let queryResponse = await index.query({
-        queryRequest: {
-          topK: 10,
-          vector: queryEmbedding,
-          includeMetadata: true,
-          includeValues: true,
-        },
+app.post("/question", async (req, res) => {
+  const question = req.body.question;
+  console.log("Received POST request to /question");
+  console.log(clients);
+
+  try {
+    console.log("Querying Pinecone vector store...");
+
+    const index = client.Index(indexName);
+
+    const queryEmbedding = await new OpenAIEmbeddings().embedQuery(question);
+
+    let queryResponse = await index.query({
+      queryRequest: {
+        topK: 10,
+        vector: queryEmbedding,
+        includeMetadata: true,
+        includeValues: true,
+      },
+    });
+
+    console.log(`Found ${queryResponse.matches.length} matches...`);
+
+    console.log(`Asking question: ${question}...`);
+
+    if (queryResponse.matches.length) {
+      const chat = new ChatOpenAI({
+        modelName: "gpt-3.5-turbo",
+        streaming: true,
+        callbacks: [
+          {
+            handleLLMNewToken(token) {
+              clients[0].write(`data: ${JSON.stringify(token)}\n\n`),
+                console.log(JSON.stringify(token));
+            },
+          },
+        ],
       });
 
-      console.log(`Found ${queryResponse.matches.length} matches...`);
+      const concatenatedPageContent = queryResponse.matches
+        .map((match) => match.metadata.pageContent)
+        .join(" ");
 
-      console.log(`Asking question: ${question}...`);
+      // Fetch all stored questions and responses from the conversation data folder
+      let chatHistoryArray = [];
+      try {
+        const files = readdir(conversationDataFolder);
+        for (const file of files) {
+          const filePath = path.join(conversationDataFolder, file);
+          const content = readFile(filePath, "utf-8");
+          const data = JSON.parse(content);
+          chatHistoryArray.push(...data);
 
-      if (queryResponse.matches.length) {
-        const chat = new ChatOpenAI({
-          modelName: "gpt-3.5-turbo",
-          streaming: true,
-          callbacks: [
-            {
-              handleLLMNewToken(token) {
-                if (ws.readyState === 1) {
-                  ws.send(token);
-                  console.log(`Sent token: ${token}`);
-                } else {
-                  console.log(`WebSocket is not open`);
-                }
-              },
-            },
-          ],
-        });
-
-        const concatenatedPageContent = queryResponse.matches
-          .map((match) => match.metadata.pageContent)
-          .join(" ");
-
-        // Fetch all stored questions and responses from the conversation data folder
-        let chatHistoryArray = [];
-        try {
-          const files = await readdir(conversationDataFolder);
-          for (const file of files) {
-            const filePath = path.join(conversationDataFolder, file);
-            const content = await readFile(filePath, "utf-8");
-            const data = JSON.parse(content);
-            chatHistoryArray.push(...data);
-
-            // Set a timer to delete the file after 5 minutes
-            setTimeout(async () => {
-              try {
-                await unlink(filePath);
-                console.log(`Deleted file: ${filePath}`);
-              } catch (error) {
-                console.error(`Error deleting file: ${filePath}`, error);
-              }
-            }, 5 * 60 * 1000); // 5 minutes
-          }
-        } catch (err) {
-          console.error("Error reading conversation data folder:", err);
+          // Set a timer to delete the file after 5 minutes
+          setTimeout(async () => {
+            try {
+              await unlink(filePath);
+              console.log(`Deleted file: ${filePath}`);
+            } catch (error) {
+              console.error(`Error deleting file: ${filePath}`, error);
+            }
+          }, 5 * 60 * 1000); // 5 minutes
         }
-
-        let historyString = chatHistoryArray
-          .map(({ message }) => message)
-          .join(" ");
-        let combinedInput = concatenatedPageContent + historyString;
-
-        const messages = ChatPromptTemplate.fromPromptMessages([
-          SystemMessagePromptTemplate.fromTemplate(
-            "Welcome to the Executive Chef chatbot we will need you to review the data given and answer questions about it to assist onboarding people to this source code."
-          ),
-          HumanMessagePromptTemplate.fromTemplate("{input}"),
-        ]);
-
-        const chain = new ConversationChain({
-          prompt: messages,
-          llm: chat,
-        });
-
-        const queryRes = await chain.call({
-          input: [question],
-        });
-        try {
-          ws.send("√∫√");
-        } catch (err) {
-          console.log(err);
-        }
-
-        // Update the chat history with the new question and response
-        chatHistoryArray.push({ message: question, from: "user" });
-        chatHistoryArray.push({ message: queryRes.response, from: "bot" });
-
-        // Save the conversation data to the local storage folder
-        const timestamp = new Date().getTime();
-        const fileName = `conversation_${timestamp}.json`;
-        const filePath = path.join(conversationDataFolder, fileName);
-        try {
-          await writeFile(filePath, JSON.stringify(chatHistoryArray), "utf-8");
-          console.log("Conversation data saved:", filePath);
-        } catch (err) {
-          console.error("Error saving conversation data:", err);
-        }
-      } else {
-        console.log("Since there are no matches, GPT-3 will not be queried.");
-
-        // Return an empty string or any default message when no matches are found
-        return "NO MATCHES FOUND";
+      } catch (err) {
+        console.error("Error reading conversation data folder:", err);
       }
-    } catch (error) {
-      console.error(error);
-      ws.send(JSON.stringify({ error: "An error occurred on the server" }));
+
+      let historyString = chatHistoryArray
+        .map(({ message }) => message)
+        .join(" ");
+      //add to input array
+      let combinedInput = concatenatedPageContent + historyString;
+
+      const messages = await ChatPromptTemplate.fromPromptMessages([
+        SystemMessagePromptTemplate.fromTemplate(
+          "Welcome to the Executive Chef chatbot we will need you to review the data given and answer questions about it to assist onboarding people to this source code."
+        ),
+        HumanMessagePromptTemplate.fromTemplate("{input}"),
+      ]);
+
+      const chain = await new ConversationChain({
+        prompt: messages,
+        llm: chat,
+      });
+
+      const queryRes = await chain.call({
+        //input: [combibnedInput, question],switch to this for context and memory.
+        input: [question],
+      });
+      clients[0].write(`data: ${JSON.stringify("!%!")}\n\n`);
+
+      // Update the chat history with the new question and response
+      chatHistoryArray.push({ message: question, from: "user" });
+      chatHistoryArray.push({ message: queryRes.response, from: "bot" });
+
+      // Save the conversation data to the local storage folder
+      const timestamp = new Date().getTime();
+      const fileName = `conversation_${timestamp}.json`;
+      const filePath = path.join(conversationDataFolder, fileName);
+      try {
+        writeFile(filePath, JSON.stringify(chatHistoryArray), "utf-8");
+        console.log("Conversation data saved:", filePath);
+      } catch (err) {
+        console.error("Error saving conversation data:", err);
+      }
+    } else {
+      console.log("Since there are no matches, GPT-3 will not be queried.");
+
+      // Return an empty string or any default message when no matches are found
+      return "NO MATCHES FOUND";
     }
-  });
+    res.status(200).send("OK");
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "An error occurred on the server" });
+  }
 });
 
 server.listen(4000, () => {
   console.log("Server started on port 4000");
 });
+
+cloneParseOrPullParse();
+createPineconeIndex(client, indexName, vectorDimension);
